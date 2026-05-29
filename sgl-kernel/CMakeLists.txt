@@ -124,7 +124,8 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-O3"
     "-Xcompiler"
     "-fPIC"
-    "-gencode=arch=compute_90,code=sm_90"
+    # base sm_90 gencode dropped for GB10 sm_121a-only build (umankb 2026-05-28);
+    # sm_121a comes from the SM100A block below (CUDA_VERSION>=12.8 path).
     "-std=c++17"
     "-DFLASHINFER_ENABLE_F16"
     "-DCUTE_USE_PACKED_TUPLE=1"
@@ -136,10 +137,11 @@ set(SGL_KERNEL_CUDA_FLAGS
     "--expt-relaxed-constexpr"
     "--expt-extended-lambda"
 
-    # The following flag leads to the CMAKE_BUILD_PARALLEL_LEVEL breaking,
-    # it triggers OOM with low memory host. Extract the threads number to
-    # option named SGL_KERNEL_COMPILE_THREADS, default value 32.
-    # "--threads=32"
+    # nvcc --threads is appended below via SGL_KERNEL_COMPILE_THREADS (default 32).
+    # On low-memory or unified-memory hosts (Jetson, GB10/DGX Spark) the
+    # effective concurrency (MAX_JOBS x --threads) can OOM-kill the build
+    # mid-compile; override with -DSGL_KERNEL_COMPILE_THREADS=1 or =2.
+    # See README "Limit build resource usage" for empirical peak-memory data.
 
     # Supress warnings
     "-Xcompiler=-Wno-clang-format-violations"
@@ -156,7 +158,7 @@ set(SGL_KERNEL_CUDA_FLAGS
     # "--ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage"
 )
 
-set(SGL_KERNEL_COMPILE_THREADS 32 CACHE STRING "Set compilation threads, default 32")
+set(SGL_KERNEL_COMPILE_THREADS 32 CACHE STRING "nvcc --threads value (default 32). Lower (e.g. 1-2) for low-memory or unified-memory hosts; see README 'Limit build resource usage' for peak-memory data.")
 
 # When SGL_KERNEL_COMPILE_THREADS value is less than 1, set it to 1
 if (NOT SGL_KERNEL_COMPILE_THREADS MATCHES "^[0-9]+$")
@@ -205,31 +207,19 @@ if (ENABLE_BELOW_SM90)
 endif()
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
+    # GB10/sm_121a-only patch (umankb 2026-05-18): strip non-target gencodes to slash build time/memory
+    # Original list contained: sm_100a, sm_120a, sm_103a, sm_110a, sm_121a, sm_90a (6 gencodes).
     list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-gencode=arch=compute_100a,code=sm_100a"
-        "-gencode=arch=compute_120a,code=sm_120a"
+        "-gencode=arch=compute_121a,code=sm_121a"
+        "--compress-mode=size"
     )
-    # refer sm_121, sm_110 and sm_101 description  https://github.com/pytorch/pytorch/pull/156176
-    if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
-        list(APPEND SGL_KERNEL_CUDA_FLAGS
-            "-gencode=arch=compute_103a,code=sm_103a"
-            "--compress-mode=size"
-        )
-        if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
-            list(APPEND SGL_KERNEL_CUDA_FLAGS
-                "-gencode=arch=compute_110a,code=sm_110a"
-                "-gencode=arch=compute_121a,code=sm_121a"
-            )
-        endif()
-    else()
-        if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
-            list(APPEND SGL_KERNEL_CUDA_FLAGS
-                "-gencode=arch=compute_101a,code=sm_101a"
-            )
-        endif()
-    endif()
 endif()
 
+# FA3 (flash_ops) stays OFF on GB10/aarch64: DEFAULT_SGL_KERNEL_ENABLE_FA3 is OFF
+# by default on aarch64 (set above), so the sm_90a gencode below is NOT appended on
+# this box -- flash_ops is 252 Hopper sm_90a instantiations that cannot run on sm_121a
+# and are never selected (we use triton/flashinfer, never --attention-backend fa3).
+# Re-enable by building with -DSGL_KERNEL_ENABLE_FA3=ON only if serving FA3 on Hopper.
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" AND SGL_KERNEL_ENABLE_FA3)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"
@@ -334,6 +324,7 @@ target_include_directories(common_ops_sm90_build PRIVATE ${INCLUDES})
 set_target_properties(common_ops_sm90_build PROPERTIES
     OUTPUT_NAME "common_ops"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm90"
+    CUDA_ARCHITECTURES OFF
 )
 
 # =========================== Common SM100+ Build ============================= #
@@ -348,6 +339,7 @@ target_include_directories(common_ops_sm100_build PRIVATE ${INCLUDES})
 set_target_properties(common_ops_sm100_build PROPERTIES
     OUTPUT_NAME "common_ops"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm100"
+    CUDA_ARCHITECTURES OFF
 )
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
@@ -490,7 +482,11 @@ target_link_libraries(spatial_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
 install(TARGETS spatial_ops LIBRARY DESTINATION sgl_kernel)
 
 # ============================ Extra Install: FLashMLA ============================= #
-include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla.cmake)
+# FlashMLA (flashmla_ops) DISABLED for GB10 sm_121a-only build (umankb 2026-05-28):
+# builds sm_100a/103a/90a cubins (no sm_121a) and is gated on use_mla_backend=True,
+# i.e. DeepSeek-MLA-class models only, which we do not run. Re-enable the include and
+# add sm_121a to cmake/flashmla.cmake if you ever serve a DeepSeek-MLA model on GB10.
+# include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla.cmake)
 
 # ============================ Extra Install: triton kernels ============================= #
 install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernels/"

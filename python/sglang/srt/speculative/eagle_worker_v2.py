@@ -437,13 +437,45 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         supports_cuda_draft_extend_graph = (
             _is_cuda or _is_musa
         ) and graph_supported_backend
+        build_draft_extend_graph = bool(
+            self.draft_extend_attn_backend
+            and (
+                _is_npu
+                or supports_cuda_draft_extend_graph
+                or supports_hip_aiter_draft_extend_graph
+            )
+        )
+        # GB10 multi-node fix: the draft-extend cudagraph runner runs a collective
+        # tp_group.barrier() per batch size during capture, so it MUST be built on ALL
+        # TP ranks or NONE. The per-rank decision above can diverge across single-GPU-
+        # per-node ranks (the draft-extend attn backend type is resolved per rank from a
+        # current-device capability probe), which deadlocks init: one rank enters the
+        # collective capture while the other proceeds to the scheduler event loop. Make
+        # the decision unanimous (logical AND) across the TP group.
+        if self.draft_runner.tp_size > 1:
+            import torch.distributed as dist
+
+            _decisions = [None] * self.draft_runner.tp_size
+            dist.all_gather_object(
+                _decisions,
+                build_draft_extend_graph,
+                group=self.draft_runner.tp_group.cpu_group,
+            )
+            _agreed = all(bool(d) for d in _decisions)
+            if _agreed != build_draft_extend_graph:
+                logger.warning(
+                    "[draft-extend-cudagraph] cross-rank build decision diverged "
+                    "(local=%s gathered=%s -> agreed=%s); reconciled to avoid a "
+                    "collective-barrier deadlock. draft_extend_attn_backend=%s",
+                    build_draft_extend_graph,
+                    _decisions,
+                    _agreed,
+                    type(self.draft_extend_attn_backend).__name__,
+                )
+            build_draft_extend_graph = _agreed
         # Capture extend
         # TODO: support draft extend cuda graph for more attention backends
-        if self.draft_extend_attn_backend and (
-            _is_npu
-            or supports_cuda_draft_extend_graph
-            or supports_hip_aiter_draft_extend_graph
-        ):
+        if build_draft_extend_graph:
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             log_info_on_rank0(

@@ -480,9 +480,52 @@ class EagleVerifyInputV2Mixin:
                 else get_tp_group()
             )
             if tp_group.world_size > 1:
-                tp_group.broadcast(predict, src=0)
-                tp_group.broadcast(accept_index, src=0)
-                tp_group.broadcast(num_correct_drafts, src=0)
+                # [GB10] Fuse the three verify-sync broadcasts into a single
+                # collective over one contiguous buffer.
+                #
+                # WHY: on cross-node (single-GPU-per-node) TP=2 these three small
+                # back-to-back broadcasts have hung the forward stream with an NCCL
+                # collective timeout (confirmed: rank-0 watchdog C-stack at this
+                # exact `sample()` -> tp_group.broadcast site, OpType=BROADCAST
+                # NumelIn=8; SeqNum enqueued 43216-43218, completed 43215; the
+                # scheduler thread then blocks forever in the downstream
+                # copy_done.synchronize() and the /health detok heartbeat trips).
+                # Three separate enqueue points on the cross-node link is exactly
+                # the "order of collectives not the same / a scheduled collective
+                # didn't run" hazard NCCL names; collapsing to ONE collective
+                # removes the inter-broadcast desync window and cuts the cross-node
+                # launch/handshake cost 3x.
+                #
+                # SYMMETRY (the d3433cb09 lesson): predict/accept_index/
+                # num_correct_drafts are all int32 and their shapes derive only
+                # from bs and self.spec_steps, both of which are byte-identical
+                # across ranks (the decode batch is delivered to every TP rank via
+                # broadcast_pyobj in recv_requests, and this whole branch is gated
+                # by the rank-identical sampling_info.is_all_greedy). So the packed
+                # buffer has the same length on both ranks and the single broadcast
+                # is issued unanimously -- it cannot itself introduce a divergence.
+                # Feature-preserving: NEXTN/cudagraph/mamba/multimodal untouched;
+                # this only changes HOW the existing sync values cross the wire.
+                _predict_n = predict.numel()
+                _accept_n = accept_index.numel()
+                _packed = torch.empty(
+                    _predict_n + _accept_n + num_correct_drafts.numel(),
+                    dtype=torch.int32,
+                    device=device,
+                )
+                _packed[:_predict_n].copy_(predict.reshape(-1))
+                _packed[_predict_n : _predict_n + _accept_n].copy_(
+                    accept_index.reshape(-1)
+                )
+                _packed[_predict_n + _accept_n :].copy_(num_correct_drafts)
+                tp_group.broadcast(_packed, src=0)
+                predict = _packed[:_predict_n].view_as(predict)
+                accept_index = _packed[
+                    _predict_n : _predict_n + _accept_n
+                ].view_as(accept_index)
+                num_correct_drafts = _packed[
+                    _predict_n + _accept_n :
+                ].view_as(num_correct_drafts)
 
         if SIMULATE_ACC_LEN > 0:
             # Do simulation

@@ -639,7 +639,63 @@ class SchedulerBatchResultProcessor:
         result: GenerationBatchResult,
     ):
         if result.copy_done is not None:
-            result.copy_done.synchronize()
+            # [GB10][spec][diag] Instrument the decode-path D2H sync so a
+            # cross-node TP=2 NEXTN stall is self-diagnosing in the journal.
+            #
+            # copy_done is a CUDA event recorded (utils.py copy_to_cpu ->
+            # copy_done.record()) AFTER this iteration's verify/draft/draft_extend
+            # GPU work + async D2H copies on the forward stream. synchronize()
+            # therefore CPU-blocks until ALL of that drains. If a TP collective
+            # baked into the (cudagraph-replayed or eager) draft/verify/draft_extend
+            # forward stalls on one rank, this wait never returns -> the scheduler
+            # event loop never reaches maybe_send_health_check_signal()
+            # (scheduler.process_batch_result) and never emits output, so
+            # tokenizer_manager.last_receive_tstamp goes stale and the /health
+            # check (http_server) trips with "couldn't get a response from
+            # detokenizer". This is NOT a slow detok thread.
+            #
+            # We poll the event non-blockingly to tell a SLOW sync (query() goes
+            # True after N s) apart from a true cross-rank DEADLOCK (query() stays
+            # False indefinitely while the peer rank is parked in NCCL). This is
+            # feature-preserving and cross-rank SYMMETRIC: every TP rank runs the
+            # identical code, the event/poll are node-local, and the eventual
+            # synchronize() is unchanged -- no collective is added, moved, or
+            # gated, so it cannot itself desync the ranks (the d3433cb09 lesson).
+            warn_after_s = envs.SGLANG_DEBUG_SPEC_DECODE_SYNC_WARN_SECS.get()
+            if warn_after_s > 0:
+                import time as _time
+
+                _t0 = _time.monotonic()
+                _warned = False
+                while not result.copy_done.query():
+                    if (
+                        not _warned
+                        and (_elapsed := _time.monotonic() - _t0) >= warn_after_s
+                    ):
+                        logger.error(
+                            "[spec-decode-sync] decode copy_done not complete "
+                            "after %.1fs (tp_rank=%s bs=%s forward_ct=%s spec_v2=%s). "
+                            "If this line repeats with no peer progress the forward "
+                            "stream is blocked on a cross-rank collective (NEXTN "
+                            "verify/draft_extend) -> heartbeat will go stale. "
+                            "py-spy BOTH ranks NOW.",
+                            _elapsed,
+                            getattr(self.model_worker, "tp_rank", "?"),
+                            batch.batch_size(),
+                            getattr(self.metrics_reporter, "forward_ct_decode", "?"),
+                            batch.is_spec_v2,
+                        )
+                        _warned = True
+                    _time.sleep(0.5)
+                if _warned:
+                    logger.error(
+                        "[spec-decode-sync] decode copy_done RECOVERED after %.1fs "
+                        "(tp_rank=%s) -- this was a SLOW sync, not a hard deadlock.",
+                        _time.monotonic() - _t0,
+                        getattr(self.model_worker, "tp_rank", "?"),
+                    )
+            else:
+                result.copy_done.synchronize()
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None

@@ -546,6 +546,14 @@ class Envs:
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
+    # [GB10] Debug instrumentation for cross-node TP=2 NEXTN stalls. When > 0,
+    # the decode-path D2H sync (process_batch_result_decode -> copy_done) polls
+    # the CUDA event non-blockingly and logs an ERROR every time the wait exceeds
+    # this many seconds, then logs a RECOVERED line if it completes. Lets a live
+    # stall self-classify in the journal as a SLOW sync vs a hard cross-rank
+    # collective deadlock (event never completes) without needing to catch a
+    # py-spy in the act. 0 = off (plain blocking synchronize, prod default).
+    SGLANG_DEBUG_SPEC_DECODE_SYNC_WARN_SECS = EnvFloat(0.0)
     # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.

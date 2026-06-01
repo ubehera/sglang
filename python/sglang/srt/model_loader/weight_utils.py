@@ -946,6 +946,7 @@ def safetensors_weights_iterator(
 
 def fastsafetensors_weights_iterator(
     hf_weights_files: List[str],
+    drop_cache_after_load: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """
     Iterate over the weights in the model safetensor files
@@ -1009,6 +1010,9 @@ def fastsafetensors_weights_iterator(
                 pass
         finally:
             loader.close()
+        if drop_cache_after_load:
+            for _f in f_list:
+                _drop_file_cache_after_load(_f)
 
 
 def multi_thread_safetensors_weights_iterator(
